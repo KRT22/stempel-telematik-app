@@ -1,0 +1,7 @@
+[server]
+headless = true
+maxUploadSize = 200   # in MB; raise if your PDFs are larger
+enableXsrfProtection = true
+
+[theme]
+base = "light"
