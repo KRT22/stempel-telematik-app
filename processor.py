@@ -50,28 +50,54 @@ def hhmm_min_key(s: Optional[str]):
     return (dt.hour if not pd.isna(dt) else 99, dt.minute if not pd.isna(dt) else 99)
 
 
+# ----------------- NEU: Header/Datum-Erkennung & Fallback -----------------
+HEADER_WITH_BIS = re.compile(
+    r"stempel[-\s]?protokoll\s+(.+?)\s+(\d{2}\.\d{2}\.\d{4})\s+bis\s+(\d{2}\.\d{2}\.\d{4})",
+    re.IGNORECASE,
+)
+HEADER_SINGLE_DATE = re.compile(
+    r"stempel[-\s]?protokoll\s+(.+?)\s+(\d{2}\.\d{2}\.\d{4})\b",
+    re.IGNORECASE,
+)
+DATE_RX = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
+
+def _name_to_display(raw_name: str) -> str:
+    raw_name = (raw_name or "").strip()
+    if "," in raw_name:
+        last, first = [x.strip() for x in raw_name.split(",", 1)]
+        return f"{first} {last}"
+    return raw_name
+
+def _auto_pick_first_date_on_page(lines) -> Optional[str]:
+    """Erste DD.MM.JJJJ im Seiteninhalt finden (z.B. aus der Tabellenzeile)."""
+    for ln in lines:
+        joined = " ".join((w.get("text","") or "") for w in ln)
+        m = DATE_RX.search(joined)
+        if m:
+            return m.group(0)
+    return None
+
+
 # ----------------- PDF parsen (Name + von/bis -> start/stop) -----------------
 def _find_name_and_left_date(page_text: str):
     """
-    Kopfzeile z.B.:
-    'Stempel-Protokoll Nachname, Vorname 29.09.2025 bis 28.10.2025'
-    Liefert 'Vorname Nachname' und das linke Datum (z.B. 29.09.2025).
+    Unterstützt BEIDE Kopfzeilen-Varianten:
+      1) '... <Name> DD.MM.YYYY bis DD.MM.YYYY'  -> (Vorname Nachname, linkes Datum)
+      2) '... <Name> DD.MM.YYYY'                 -> (Vorname Nachname, Datum)
     """
-    rx = re.compile(
-        r"stempel[-\s]?protokoll\s+(.+?)\s+(\d{2}\.\d{2}\.\d{4})\s+bis\b",
-        re.IGNORECASE,
-    )
-    m = rx.search(page_text or "")
-    if not m:
-        return None, None
-    raw_name, left_date = m.groups()
-    raw_name = raw_name.strip()
-    if "," in raw_name:
-        last, first = [x.strip() for x in raw_name.split(",", 1)]
-        emp = f"{first} {last}"
-    else:
-        emp = raw_name
-    return emp, left_date
+    txt = page_text or ""
+
+    m = HEADER_WITH_BIS.search(txt)
+    if m:
+        raw_name, left_date, _ = m.groups()
+        return _name_to_display(raw_name), left_date
+
+    m = HEADER_SINGLE_DATE.search(txt)
+    if m:
+        raw_name, date_only = m.groups()
+        return _name_to_display(raw_name), date_only
+
+    return None, None
 
 def _get_lines(words, tol_y: float = 3.0):
     lines = []
@@ -125,8 +151,12 @@ def _extract_start_stop_for_date(page, target_date: str):
     words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
     lines = _get_lines(words)
 
+    # Fallback: falls kein Datum aus dem Header, Datum aus Seiteninhalt autodetektiert
+    if not target_date:
+        target_date = _auto_pick_first_date_on_page(lines)
+
     header_ln, von_x, bis_x = _find_table_header_line(lines)
-    if header_ln is None or von_x is None or bis_x is None:
+    if header_ln is None or von_x is None or bis_x is None or not target_date:
         return None, None
 
     starts, stops = [], []
@@ -145,6 +175,8 @@ def _extract_start_stop_for_date(page, target_date: str):
 def parse_stempel_pdf_to_df(pdf_bytes: bytes, explicit_date: Optional[str] = None):
     """
     Liefert df_stempel: ["Mitarbeiter","start","stop"] und verwendetes Datum (TT.MM.JJJJ).
+    - Header kann '... bis ...' ODER nur ein Datum enthalten.
+    - Falls Header kein Datum liefert, wird die erste DD.MM.JJJJ im Seiteninhalt verwendet.
     """
     rows = []
     used_date = None
@@ -152,23 +184,41 @@ def parse_stempel_pdf_to_df(pdf_bytes: bytes, explicit_date: Optional[str] = Non
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            emp, left_date = _find_name_and_left_date(text)
-            if not emp or not left_date:
+            emp, header_date = _find_name_and_left_date(text)
+
+            # Zeilen für möglichen Auto-Date-Fallback vorbereiten
+            words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+            lines = _get_lines(words)
+
+            # Datum für diese Seite bestimmen
+            date_str = explicit_date or header_date or _auto_pick_first_date_on_page(lines)
+            if not emp and not date_str:
+                # Nichts Verwertbares auf der Seite
                 continue
 
-            date_str = explicit_date or left_date
-            st, sp = _extract_start_stop_for_date(page, date_str)
-            rows.append({"Mitarbeiter": emp, "start": st, "stop": sp})
+            st, sp = _extract_start_stop_for_date(page, date_str or "")
+            rows.append({"Mitarbeiter": emp or "", "start": st, "stop": sp})
 
-            if used_date is None:
+            if used_date is None and date_str:
                 used_date = date_str
 
     if not rows:
         raise ValueError("Keine 'von'/'bis'-Werte im PDF gefunden. Falls das PDF gescannt ist, wird eine Textschicht/OCR benötigt.")
 
+    # globaler Fallback, falls bisher kein Datum feststand
+    if not used_date:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf2:
+            for page in pdf2.pages:
+                words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+                lines = _get_lines(words)
+                guess = _auto_pick_first_date_on_page(lines)
+                if guess:
+                    used_date = guess
+                    break
+
     df = pd.DataFrame(rows)
     df["match_key"] = df["Mitarbeiter"].map(norm_name)
-    return df, used_date or (explicit_date or "")
+    return df, (used_date or (explicit_date or ""))
 
 
 # ----------------- Telematik einlesen & konsolidieren -----------------
